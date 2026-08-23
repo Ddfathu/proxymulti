@@ -1,8 +1,11 @@
 ### proxy multi protocol railway 
 
 1.SOCKS5 Proxy (RFC 1928 & RFC 1929) with user password 
+
 2.HTTPS Tunnel / HTTP CONNECT Proxy (with user password)
-3. HTTP Forward / Reverse Proxy (HTTP SCAN) no user password 
+
+3. HTTP Forward / Reverse Proxy (HTTP SCAN) no user password
+  
 4. TLS SNI / Direct TCP Stream Proxy(no user password)
 
 ### cara install
