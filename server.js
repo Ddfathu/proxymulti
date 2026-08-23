@@ -6,12 +6,11 @@ const PORT = process.env.PORT || 8080;
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
 
-// --- CONFIG ADMIN & USER MANAGEMENT (DIKONTROL DARI UI) ---
-let ADMIN_CREDENTIALS = null; // Default null agar memicu Wizard Setup di UI jika belum diset
+// --- CONFIG ADMIN & USER MANAGEMENT (KONTROL DARI UI) ---
+let ADMIN_CREDENTIALS = null; 
 const adminSessions = new Set();
-const proxyUsers = new Map(); // Daftar User & Password Proxy
+const proxyUsers = new Map(); 
 
-// Mode Auth: 'AUTH' (Wajib User/Pass) atau 'NONE' (Public/Bebas)
 let PROXY_AUTH_MODE = 'AUTH'; 
 
 let PROXY_SERVER_INFO = {
@@ -39,7 +38,7 @@ function updateRailwayProxyIP() {
 updateRailwayProxyIP();
 setInterval(updateRailwayProxyIP, 1000 * 60 * 30);
 
-// State Konfigurasi DNS
+// State Konfigurasi DNS Aktif
 let DNS_CONFIG = {
   mode: 'DOH',
   activeName: 'Cloudflare DoH (Official)',
@@ -123,7 +122,7 @@ async function resolveDomain(hostname) {
 
 function checkHttpAuth(dataStr) {
   if (PROXY_AUTH_MODE === 'NONE') return true;
-  if (proxyUsers.size === 0) return true; // Bila belum ada user terdaftar
+  if (proxyUsers.size === 0) return true;
   const match = dataStr.match(/Proxy-Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i);
   if (!match) return false;
   try {
@@ -210,7 +209,6 @@ const server = net.createServer({
     if (socksState === 0) {
       const nmethods = chunk[1];
       const methods = chunk.slice(2, 2 + nmethods);
-
       const requiresAuth = (PROXY_AUTH_MODE === 'AUTH' && proxyUsers.size > 0);
 
       if (requiresAuth) {
@@ -219,10 +217,10 @@ const server = net.createServer({
           return clientSocket.end();
         }
         socksState = 1;
-        clientSocket.write(Buffer.from([0x05, 0x02])); // 0x02 = User/Pass Auth
+        clientSocket.write(Buffer.from([0x05, 0x02]));
       } else {
         socksState = 2;
-        clientSocket.write(Buffer.from([0x05, 0x00])); // 0x00 = No Auth
+        clientSocket.write(Buffer.from([0x05, 0x00]));
       }
       return;
     }
@@ -236,9 +234,9 @@ const server = net.createServer({
 
       if (proxyUsers.has(username) && proxyUsers.get(username) === password) {
         socksState = 2;
-        clientSocket.write(Buffer.from([0x01, 0x00])); // Auth Berhasil
+        clientSocket.write(Buffer.from([0x01, 0x00]));
       } else {
-        clientSocket.write(Buffer.from([0x01, 0x01])); // Auth Gagal
+        clientSocket.write(Buffer.from([0x01, 0x01]));
         return clientSocket.end();
       }
       return;
@@ -254,10 +252,10 @@ const server = net.createServer({
       let targetPort = 0;
       const atyp = chunk[3];
 
-      if (atyp === 0x01) { // IPv4
+      if (atyp === 0x01) {
         targetHost = `${chunk[4]}.${chunk[5]}.${chunk[6]}.${chunk[7]}`;
         targetPort = chunk.readUInt16BE(8);
-      } else if (atyp === 0x03) { // Domain
+      } else if (atyp === 0x03) {
         const dLen = chunk[4];
         targetHost = chunk.slice(5, 5 + dLen).toString('utf-8');
         targetPort = chunk.readUInt16BE(5 + dLen);
@@ -276,7 +274,6 @@ const server = net.createServer({
           targetSocket.setNoDelay(true);
           targetSocket.setKeepAlive(true, 5000);
           clientSocket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10]));
-          
           clientSocket.removeAllListeners('data');
           bridgeSockets(clientSocket, targetSocket);
         });
@@ -293,17 +290,13 @@ const server = net.createServer({
   };
 
   clientSocket.on('data', async (chunk) => {
-    if (socksState > 0) {
-      return handleSocks5(chunk);
-    }
+    if (socksState > 0) return handleSocks5(chunk);
 
     if (isFirstPacket) {
       isFirstPacket = false;
 
       // 1. SOCKS5
-      if (chunk[0] === 0x05) {
-        return handleSocks5(chunk);
-      }
+      if (chunk[0] === 0x05) return handleSocks5(chunk);
 
       const dataStr = chunk.toString('utf-8');
 
@@ -335,7 +328,7 @@ const server = net.createServer({
           return;
         }
 
-        // API: Ganti Akun Admin (Khusus Admin Login)
+        // API: Ganti Akun Admin Master
         if (path === '/api/change-admin' && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -396,7 +389,6 @@ const server = net.createServer({
             }));
 
           const uniqueClients = new Set(activeList.map(c => c.clientIp)).size;
-
           const userObjects = [];
           if (isAuth) {
             proxyUsers.forEach((pass, user) => {
@@ -423,7 +415,7 @@ const server = net.createServer({
           return;
         }
 
-        // API: Set DNS
+        // API: Set DNS (Preset, Custom DoH, Custom UDP)
         if (path.startsWith('/api/set-dns') && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -431,22 +423,36 @@ const server = net.createServer({
           }
           try {
             const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
+
             if (body.preset && PRESETS[body.preset]) {
               const p = PRESETS[body.preset];
               DNS_CONFIG.mode = p.type;
               DNS_CONFIG.activeName = p.name;
               if (p.type === 'DOH') DNS_CONFIG.dohUrl = p.url;
               else { DNS_CONFIG.udpServer = p.host; DNS_CONFIG.udpPort = p.port; }
+            } else if (body.mode === 'DOH') {
+              DNS_CONFIG.mode = 'DOH';
+              DNS_CONFIG.activeName = 'Custom DoH Pribadi';
+              DNS_CONFIG.dohUrl = body.dohUrl || 'https://cloudflare-dns.com/dns-query';
+            } else if (body.mode === 'UDP') {
+              DNS_CONFIG.mode = 'UDP';
+              DNS_CONFIG.activeName = 'Custom DNS UDP Pribadi';
+              DNS_CONFIG.udpServer = body.udpServer || '1.1.1.1';
+              DNS_CONFIG.udpPort = parseInt(body.udpPort, 10) || 53;
             }
+
             dnsCache.clear();
             const resBody = JSON.stringify({ success: true, config: DNS_CONFIG });
             clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-          } catch (_) {}
+          } catch (e) {
+            const errBody = JSON.stringify({ success: false, error: e.message });
+            clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${errBody.length}\r\nConnection: close\r\n\r\n${errBody}`);
+          }
           clientSocket.end();
           return;
         }
 
-        // API: Tambah / Hapus User Proxy
+        // API: Manage Proxy Users & Mode
         if (path === '/api/manage-users' && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -468,7 +474,7 @@ const server = net.createServer({
           return;
         }
 
-        // Web UI
+        // Dashboard Web UI
         if (path === '/' || path === '/index.html') {
           const html = renderDashboardHTML();
           clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(html)}\r\nConnection: close\r\n\r\n${html}`);
@@ -623,6 +629,7 @@ function renderDashboardHTML() {
     .badge { background: #030712; border: 1px solid #1e293b; border-radius: 10px; padding: 12px 10px; text-align: center; }
     .badge h4 { margin: 0; font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; }
     .badge .val { font-size: 1.3rem; font-weight: bold; margin-top: 5px; font-family: monospace; }
+    .badge .sub-val { font-size: 0.68rem; color: #94a3b8; margin-top: 3px; font-family: monospace; word-break: break-all; }
     .section-title { font-size: 0.85rem; font-weight: bold; color: #38bdf8; margin-top: 16px; margin-bottom: 10px; }
     .conn-list { display: flex; flex-direction: column; gap: 8px; max-height: 180px; overflow-y: auto; }
     .conn-item { background: #030712; border: 1px solid #1e293b; border-left: 3px solid #39ff14; border-radius: 8px; padding: 8px 10px; font-size: 0.8rem; }
@@ -634,6 +641,7 @@ function renderDashboardHTML() {
     .user-table td { padding: 6px 4px; border-bottom: 1px solid #1e293b; font-size: 0.8rem; font-family: monospace; }
     .panel { background: #070d17; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; margin-top: 14px; }
     .hint { font-size: 0.72rem; color: #94a3b8; margin-top: 4px; }
+    .toast { display: none; padding: 8px; text-align: center; border-radius: 6px; margin-top: 10px; font-size: 0.8rem; font-weight: bold; background: #052e16; color: #4ade80; border: 1px solid #4ade80; }
   </style>
 </head>
 <body>
@@ -649,19 +657,32 @@ function renderDashboardHTML() {
     </div>
 
     <div class="badge-grid">
-      <div class="badge"><h4>Koneksi Aktif</h4><div class="val" style="color:#39ff14;" id="active_count">0</div></div>
-      <div class="badge"><h4>Mode Auth</h4><div class="val" style="color:#38bdf8; font-size:1.1rem;" id="badge_auth_mode">...</div></div>
-      <div class="badge"><h4>Total In (RX)</h4><div class="val" style="color:#00ffcc;" id="total_rx">0 B</div></div>
-      <div class="badge"><h4>Total Out (TX)</h4><div class="val" style="color:#f59e0b;" id="total_tx">0 B</div></div>
+      <div class="badge">
+        <h4>Koneksi Aktif</h4>
+        <div class="val" style="color:#39ff14;" id="active_count">0</div>
+      </div>
+      <div class="badge">
+        <h4>Status DNS</h4>
+        <div class="val" style="color:#38bdf8; font-size:1.05rem;" id="badge_dns_mode">${DNS_CONFIG.mode}</div>
+        <div class="sub-val" id="badge_dns_target">${DNS_CONFIG.mode === 'DOH' ? DNS_CONFIG.dohUrl : DNS_CONFIG.udpServer + ':' + DNS_CONFIG.udpPort}</div>
+      </div>
+      <div class="badge">
+        <h4>Total In (RX)</h4>
+        <div class="val" style="color:#00ffcc;" id="total_rx">0 B</div>
+      </div>
+      <div class="badge">
+        <h4>Total Out (TX)</h4>
+        <div class="val" style="color:#f59e0b;" id="total_tx">0 B</div>
+      </div>
     </div>
 
     <div class="section-title">🟢 LIVE CONNECTIONS (REALTIME)</div>
     <div class="conn-list" id="conn_container"></div>
 
-    <!-- 1. SETUP AWAL ADMIN (JIKA BELUM ADA ADMIN) -->
+    <!-- 1. SETUP AWAL ADMIN -->
     <div id="panel_initial_setup" class="panel" style="display:none; border-color:#f59e0b;">
       <div class="section-title" style="margin-top:0; color:#f59e0b;">⚠️ SETUP ADMIN PERTAMA KALI</div>
-      <div class="hint">Buat akun Admin master untuk mengelola proxy server langsung dari browser:</div>
+      <div class="hint">Buat akun Admin master untuk mengelola server:</div>
       <input type="text" id="setup_admin_user" placeholder="Username Admin Baru">
       <input type="password" id="setup_admin_pass" placeholder="Password Admin Baru">
       <button style="background:#f59e0b;" onclick="setupAdmin()">SIMPAN & MASUK ADMIN</button>
@@ -675,7 +696,7 @@ function renderDashboardHTML() {
       <button onclick="loginAdmin()">MASUK ADMIN</button>
     </div>
 
-    <!-- 3. ADMIN CONTROLS (SETELAH LOGIN) -->
+    <!-- 3. ADMIN CONTROLS -->
     <div id="panel_admin_dashboard" style="display:none;">
       
       <!-- USER MANAGEMENT PROXY -->
@@ -684,7 +705,7 @@ function renderDashboardHTML() {
           <span class="section-title" style="margin:0;">👤 USER & PASSWORD PROXY</span>
           <button onclick="logoutAdmin()" style="width:auto; padding:4px 8px; background:#475569; color:#fff; font-size:0.7rem; margin:0;">Logout</button>
         </div>
-        <div class="hint">Daftar kredensial yang berlaku untuk SOCKS5 & HTTP Proxy:</div>
+        <div class="hint">Kredensial untuk autentikasi SOCKS5 & HTTP Proxy:</div>
         
         <div style="margin-top:10px;">
           <label style="font-size:0.75rem; color:#94a3b8;">Enforce Mode:</label>
@@ -713,17 +734,34 @@ function renderDashboardHTML() {
         <button style="background:#38bdf8;" onclick="changeAdminCreds()">UPDATE KREDENSIAL ADMIN</button>
       </div>
 
-      <!-- DNS RESOLVER -->
+      <!-- DNS RESOLVER & CUSTOM DOH / UDP -->
       <div class="panel">
-        <div class="section-title" style="margin:0;">⚙️ DNS RESOLVER</div>
-        <select id="preset_select">
+        <div class="section-title" style="margin:0;">⚙️ DNS RESOLVER SETTINGS</div>
+        <select id="preset_select" onchange="applyPresetUI()">
           <option value="cf-doh">Cloudflare DoH (Official)</option>
           <option value="google-doh">Google DoH</option>
           <option value="quad9-doh">Quad9 DoH (Security)</option>
           <option value="adguard-doh">AdGuard DoH (Adblock)</option>
-          <option value="cf-udp">Cloudflare UDP (1.1.1.1)</option>
+          <option value="cf-udp">Cloudflare UDP (1.1.1.1:53)</option>
+          <option value="google-udp">Google UDP (8.8.8.8:53)</option>
+          <option value="custom_doh">✏️ Custom DoH Pribadi (URL)</option>
+          <option value="custom_udp">✏️ Custom DNS UDP Pribadi (IP + Port)</option>
         </select>
+
+        <div id="box_custom_doh" style="display:none; margin-top:8px;">
+          <label style="font-size:0.75rem; color:#94a3b8;">Masukkan URL DoH Kustom:</label>
+          <input type="text" id="custom_doh_url" placeholder="https://dns.nextdns.io/xxxxxx" value="${DNS_CONFIG.dohUrl}">
+        </div>
+
+        <div id="box_custom_udp" style="display:none; margin-top:8px;">
+          <label style="font-size:0.75rem; color:#94a3b8;">IP Server DNS UDP:</label>
+          <input type="text" id="custom_udp_ip" placeholder="IP: 94.140.14.14" value="${DNS_CONFIG.udpServer}">
+          <label style="font-size:0.75rem; color:#94a3b8; margin-top:4px; display:block;">Port DNS UDP:</label>
+          <input type="number" id="custom_udp_port" placeholder="Port: 53" value="${DNS_CONFIG.udpPort || 53}">
+        </div>
+
         <button onclick="saveDns()">💾 SIMPAN DNS</button>
+        <div id="dns_toast" class="toast">✅ DNS Berhasil Diperbarui!</div>
       </div>
 
     </div>
@@ -738,9 +776,14 @@ function renderDashboardHTML() {
         document.getElementById('active_count').innerText = data.totalActive;
         document.getElementById('total_rx').innerText = data.globalTotalIn;
         document.getElementById('total_tx').innerText = data.globalTotalOut;
-        document.getElementById('badge_auth_mode').innerText = data.authMode;
 
-        // Routing Panel UI
+        if (data.dnsConfig) {
+          document.getElementById('badge_dns_mode').innerText = data.dnsConfig.mode + ' (' + (data.dnsConfig.activeName || 'Active') + ')';
+          document.getElementById('badge_dns_target').innerText = data.dnsConfig.mode === 'DOH' 
+            ? data.dnsConfig.dohUrl 
+            : data.dnsConfig.udpServer + ':' + data.dnsConfig.udpPort;
+        }
+
         if (!data.hasAdmin) {
           document.getElementById('panel_initial_setup').style.display = 'block';
           document.getElementById('panel_login').style.display = 'none';
@@ -827,7 +870,7 @@ function renderDashboardHTML() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: u, password: p })
       });
-      if (res.ok) alert('Akun Admin berhasil diperbarui!');
+      if (res.ok) alert('Akun Admin master berhasil diperbarui!');
     }
 
     async function logoutAdmin() {
@@ -868,14 +911,40 @@ function renderDashboardHTML() {
       fetchStats();
     }
 
+    function applyPresetUI() {
+      const val = document.getElementById('preset_select').value;
+      document.getElementById('box_custom_doh').style.display = (val === 'custom_doh') ? 'block' : 'none';
+      document.getElementById('box_custom_udp').style.display = (val === 'custom_udp') ? 'block' : 'none';
+    }
+
     async function saveDns() {
-      const preset = document.getElementById('preset_select').value;
-      await fetch('/api/set-dns', {
+      const selected = document.getElementById('preset_select').value;
+      let payload = {};
+
+      if (selected === 'custom_doh') {
+        payload = { mode: 'DOH', dohUrl: document.getElementById('custom_doh_url').value.trim() };
+      } else if (selected === 'custom_udp') {
+        payload = {
+          mode: 'UDP',
+          udpServer: document.getElementById('custom_udp_ip').value.trim(),
+          udpPort: document.getElementById('custom_udp_port').value.trim()
+        };
+      } else {
+        payload = { preset: selected };
+      }
+
+      const res = await fetch('/api/set-dns', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preset })
+        body: JSON.stringify(payload)
       });
-      alert('DNS berhasil disimpan!');
+      const data = await res.json();
+      if (data.success) {
+        const toast = document.getElementById('dns_toast');
+        toast.style.display = 'block';
+        setTimeout(() => toast.style.display = 'none', 3000);
+        fetchStats();
+      }
     }
 
     setInterval(fetchStats, 2000);
@@ -886,5 +955,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Proxy Hub Server running on port ${PORT}`);
+  console.log(`Multi-Protocol SOCKS5 & HTTP Proxy running on port ${PORT}`);
 });
