@@ -6,19 +6,12 @@ const PORT = process.env.PORT || 8080;
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
 
-// --- CONFIG ADMIN & USER MANAGEMENT ---
-let ADMIN_CREDENTIALS = {
-  username: process.env.ADMIN_USER || 'admin',
-  password: process.env.ADMIN_PASS || 'admin123'
-};
-
+// --- CONFIG ADMIN & USER MANAGEMENT (DIKONTROL DARI UI) ---
+let ADMIN_CREDENTIALS = null; // Default null agar memicu Wizard Setup di UI jika belum diset
 const adminSessions = new Set();
-const proxyUsers = new Map([
-  // Default user contoh: user / pass
-  ['user1', 'pass123']
-]);
+const proxyUsers = new Map(); // Daftar User & Password Proxy
 
-// Mode Auth: 'NONE' (Semua bisa akses) atau 'AUTH' (Wajib user & password terdaftar)
+// Mode Auth: 'AUTH' (Wajib User/Pass) atau 'NONE' (Public/Bebas)
 let PROXY_AUTH_MODE = 'AUTH'; 
 
 let PROXY_SERVER_INFO = {
@@ -130,6 +123,7 @@ async function resolveDomain(hostname) {
 
 function checkHttpAuth(dataStr) {
   if (PROXY_AUTH_MODE === 'NONE') return true;
+  if (proxyUsers.size === 0) return true; // Bila belum ada user terdaftar
   const match = dataStr.match(/Proxy-Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i);
   if (!match) return false;
   try {
@@ -184,7 +178,7 @@ const server = net.createServer({
 
   let isFirstPacket = true;
   let targetSocket = null;
-  let socksState = 0; // 0: Init, 1: Auth, 2: Request
+  let socksState = 0;
 
   const bridgeSockets = (sockA, sockB) => {
     sockA.on('data', (d) => { 
@@ -213,28 +207,28 @@ const server = net.createServer({
 
   // --- SOCKS5 HANDLER ---
   const handleSocks5 = async (chunk) => {
-    // Tahap 1: Greeting Handshake
     if (socksState === 0) {
       const nmethods = chunk[1];
       const methods = chunk.slice(2, 2 + nmethods);
 
-      if (PROXY_AUTH_MODE === 'AUTH') {
-        if (!methods.includes(0x02)) { // 0x02 = Username/Password
-          clientSocket.write(Buffer.from([0x05, 0xFF])); // No acceptable methods
+      const requiresAuth = (PROXY_AUTH_MODE === 'AUTH' && proxyUsers.size > 0);
+
+      if (requiresAuth) {
+        if (!methods.includes(0x02)) {
+          clientSocket.write(Buffer.from([0x05, 0xFF]));
           return clientSocket.end();
         }
         socksState = 1;
-        clientSocket.write(Buffer.from([0x05, 0x02])); // Request User/Pass Auth
+        clientSocket.write(Buffer.from([0x05, 0x02])); // 0x02 = User/Pass Auth
       } else {
         socksState = 2;
-        clientSocket.write(Buffer.from([0x05, 0x00])); // No Auth Required
+        clientSocket.write(Buffer.from([0x05, 0x00])); // 0x00 = No Auth
       }
       return;
     }
 
-    // Tahap 2: Auth Verification (Sub-negosiasi User/Pass)
     if (socksState === 1) {
-      if (chunk[0] !== 0x01) return clientSocket.end(); // Subnegotiation version 1
+      if (chunk[0] !== 0x01) return clientSocket.end();
       const uLen = chunk[1];
       const username = chunk.slice(2, 2 + uLen).toString('utf-8');
       const pLen = chunk[2 + uLen];
@@ -242,18 +236,17 @@ const server = net.createServer({
 
       if (proxyUsers.has(username) && proxyUsers.get(username) === password) {
         socksState = 2;
-        clientSocket.write(Buffer.from([0x01, 0x00])); // Auth Success
+        clientSocket.write(Buffer.from([0x01, 0x00])); // Auth Berhasil
       } else {
-        clientSocket.write(Buffer.from([0x01, 0x01])); // Auth Failure
+        clientSocket.write(Buffer.from([0x01, 0x01])); // Auth Gagal
         return clientSocket.end();
       }
       return;
     }
 
-    // Tahap 3: Connect Request
     if (socksState === 2) {
-      if (chunk[0] !== 0x05 || chunk[1] !== 0x01) { // 0x01 = CONNECT Command
-        clientSocket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); // Command not supported
+      if (chunk[0] !== 0x05 || chunk[1] !== 0x01) {
+        clientSocket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
         return clientSocket.end();
       }
 
@@ -264,12 +257,12 @@ const server = net.createServer({
       if (atyp === 0x01) { // IPv4
         targetHost = `${chunk[4]}.${chunk[5]}.${chunk[6]}.${chunk[7]}`;
         targetPort = chunk.readUInt16BE(8);
-      } else if (atyp === 0x03) { // Domain Name
+      } else if (atyp === 0x03) { // Domain
         const dLen = chunk[4];
         targetHost = chunk.slice(5, 5 + dLen).toString('utf-8');
         targetPort = chunk.readUInt16BE(5 + dLen);
       } else {
-        clientSocket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); // Address type not supported
+        clientSocket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
         return clientSocket.end();
       }
 
@@ -282,7 +275,6 @@ const server = net.createServer({
         targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
           targetSocket.setNoDelay(true);
           targetSocket.setKeepAlive(true, 5000);
-          // SOCKS5 Success Response
           clientSocket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10]));
           
           clientSocket.removeAllListeners('data');
@@ -294,7 +286,7 @@ const server = net.createServer({
           clientSocket.destroy();
         });
       } catch (err) {
-        clientSocket.write(Buffer.from([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); // Host unreachable
+        clientSocket.write(Buffer.from([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
         clientSocket.end();
       }
     }
@@ -308,7 +300,7 @@ const server = net.createServer({
     if (isFirstPacket) {
       isFirstPacket = false;
 
-      // 1. SOCKS5 PROTOCOL ENTRY (0x05)
+      // 1. SOCKS5
       if (chunk[0] === 0x05) {
         return handleSocks5(chunk);
       }
@@ -321,18 +313,58 @@ const server = net.createServer({
         const path = firstLine.split(' ')[1] || '/';
         const isAuth = isAuthenticatedAdmin(dataStr);
 
-        // API: Login Admin
-        if (path === '/api/login' && dataStr.startsWith('POST')) {
+        // API: Setup Admin Pertama Kali
+        if (path === '/api/setup-admin' && dataStr.startsWith('POST')) {
           try {
-            const bodyStr = dataStr.split('\r\n\r\n')[1] || '{}';
-            const body = JSON.parse(bodyStr);
-            if (body.username === ADMIN_CREDENTIALS.username && body.password === ADMIN_CREDENTIALS.password) {
+            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
+            if (!ADMIN_CREDENTIALS && body.username && body.password) {
+              ADMIN_CREDENTIALS = {
+                username: body.username.trim(),
+                password: body.password.trim()
+              };
               const token = crypto.randomBytes(16).toString('hex');
               adminSessions.add(token);
               const resBody = JSON.stringify({ success: true });
               clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=${token}; Path=/; HttpOnly\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
             } else {
-              const resBody = JSON.stringify({ success: false, error: 'Username atau Password Admin salah!' });
+              const resBody = JSON.stringify({ success: false, error: 'Setup sudah selesai sebelumnya!' });
+              clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+            }
+          } catch (_) {}
+          clientSocket.end();
+          return;
+        }
+
+        // API: Ganti Akun Admin (Khusus Admin Login)
+        if (path === '/api/change-admin' && dataStr.startsWith('POST')) {
+          if (!isAuth) {
+            clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+            return clientSocket.end();
+          }
+          try {
+            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
+            if (body.username && body.password) {
+              ADMIN_CREDENTIALS.username = body.username.trim();
+              ADMIN_CREDENTIALS.password = body.password.trim();
+              const resBody = JSON.stringify({ success: true });
+              clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+            }
+          } catch (_) {}
+          clientSocket.end();
+          return;
+        }
+
+        // API: Login Admin
+        if (path === '/api/login' && dataStr.startsWith('POST')) {
+          try {
+            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
+            if (ADMIN_CREDENTIALS && body.username === ADMIN_CREDENTIALS.username && body.password === ADMIN_CREDENTIALS.password) {
+              const token = crypto.randomBytes(16).toString('hex');
+              adminSessions.add(token);
+              const resBody = JSON.stringify({ success: true });
+              clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=${token}; Path=/; HttpOnly\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+            } else {
+              const resBody = JSON.stringify({ success: false, error: 'Username atau Password salah!' });
               clientSocket.write(`HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
             }
           } catch (_) {}
@@ -340,7 +372,7 @@ const server = net.createServer({
           return;
         }
 
-        // API: Logout Admin
+        // API: Logout
         if (path === '/api/logout' && dataStr.startsWith('POST')) {
           const cookies = parseCookie(dataStr);
           if (cookies.admin_session) adminSessions.delete(cookies.admin_session);
@@ -365,12 +397,21 @@ const server = net.createServer({
 
           const uniqueClients = new Set(activeList.map(c => c.clientIp)).size;
 
+          const userObjects = [];
+          if (isAuth) {
+            proxyUsers.forEach((pass, user) => {
+              userObjects.push({ username: user, password: pass });
+            });
+          }
+
           const resBody = JSON.stringify({
+            hasAdmin: ADMIN_CREDENTIALS !== null,
+            adminUsername: (isAuth && ADMIN_CREDENTIALS) ? ADMIN_CREDENTIALS.username : '',
             isAuth,
             proxyInfo: PROXY_SERVER_INFO,
             dnsConfig: DNS_CONFIG,
             authMode: PROXY_AUTH_MODE,
-            userList: isAuth ? Array.from(proxyUsers.keys()) : [],
+            userList: userObjects,
             totalActive: uniqueClients,
             globalTotalIn: formatBytes(globalTotalBytesIn),
             globalTotalOut: formatBytes(globalTotalBytesOut),
@@ -382,45 +423,30 @@ const server = net.createServer({
           return;
         }
 
-        // API: Update DNS (Wajib Admin)
+        // API: Set DNS
         if (path.startsWith('/api/set-dns') && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
             return clientSocket.end();
           }
           try {
-            const bodyStr = dataStr.split('\r\n\r\n')[1] || '{}';
-            const body = JSON.parse(bodyStr);
-
+            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
             if (body.preset && PRESETS[body.preset]) {
               const p = PRESETS[body.preset];
               DNS_CONFIG.mode = p.type;
               DNS_CONFIG.activeName = p.name;
               if (p.type === 'DOH') DNS_CONFIG.dohUrl = p.url;
               else { DNS_CONFIG.udpServer = p.host; DNS_CONFIG.udpPort = p.port; }
-            } else if (body.mode === 'DOH') {
-              DNS_CONFIG.mode = 'DOH';
-              DNS_CONFIG.activeName = 'Custom DoH Pribadi';
-              DNS_CONFIG.dohUrl = body.dohUrl || 'https://cloudflare-dns.com/dns-query';
-            } else if (body.mode === 'UDP') {
-              DNS_CONFIG.mode = 'UDP';
-              DNS_CONFIG.activeName = 'Custom DNS UDP Pribadi';
-              DNS_CONFIG.udpServer = body.udpServer || '1.1.1.1';
-              DNS_CONFIG.udpPort = parseInt(body.udpPort, 10) || 53;
             }
-
             dnsCache.clear();
             const resBody = JSON.stringify({ success: true, config: DNS_CONFIG });
             clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-          } catch (e) {
-            const errBody = JSON.stringify({ success: false, error: e.message });
-            clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${errBody.length}\r\nConnection: close\r\n\r\n${errBody}`);
-          }
+          } catch (_) {}
           clientSocket.end();
           return;
         }
 
-        // API: Tambah / Hapus User Proxy (Wajib Admin)
+        // API: Tambah / Hapus User Proxy
         if (path === '/api/manage-users' && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -435,16 +461,14 @@ const server = net.createServer({
             } else if (body.action === 'set-mode' && body.mode) {
               PROXY_AUTH_MODE = body.mode;
             }
-            const resBody = JSON.stringify({ success: true, users: Array.from(proxyUsers.keys()), mode: PROXY_AUTH_MODE });
+            const resBody = JSON.stringify({ success: true });
             clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-          } catch (e) {
-            clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
-          }
+          } catch (_) {}
           clientSocket.end();
           return;
         }
 
-        // Dashboard Web UI
+        // Web UI
         if (path === '/' || path === '/index.html') {
           const html = renderDashboardHTML();
           clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(html)}\r\nConnection: close\r\n\r\n${html}`);
@@ -513,7 +537,7 @@ const server = net.createServer({
         }
       }
 
-      // 5. STREAM VLESS / TROJAN / TLS SNI
+      // 5. STREAM VLESS / TROJAN
       const sni = parseTlsSni(chunk);
       const destinationHost = sni || 'speed.cloudflare.com';
 
@@ -585,7 +609,7 @@ function renderDashboardHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Proxy Hub & Admin Control</title>
+  <title>Proxy Hub & UI Controller</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #06090e; color: #00ffcc; padding: 14px; margin: 0; display: flex; justify-content: center; }
@@ -600,24 +624,25 @@ function renderDashboardHTML() {
     .badge h4 { margin: 0; font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; }
     .badge .val { font-size: 1.3rem; font-weight: bold; margin-top: 5px; font-family: monospace; }
     .section-title { font-size: 0.85rem; font-weight: bold; color: #38bdf8; margin-top: 16px; margin-bottom: 10px; }
-    .conn-list { display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto; }
+    .conn-list { display: flex; flex-direction: column; gap: 8px; max-height: 180px; overflow-y: auto; }
     .conn-item { background: #030712; border: 1px solid #1e293b; border-left: 3px solid #39ff14; border-radius: 8px; padding: 8px 10px; font-size: 0.8rem; }
     .tag { background: #032b17; color: #39ff14; padding: 2px 6px; border-radius: 4px; font-size: 0.65rem; }
-    select, input { width: 100%; padding: 9px; background: #030712; border: 1px solid #1e293b; border-radius: 6px; color: #fff; margin-top: 6px; font-family: monospace; font-size: 0.82rem; }
+    select, input { width: 100%; padding: 10px; background: #030712; border: 1px solid #1e293b; border-radius: 6px; color: #fff; margin-top: 6px; font-family: monospace; font-size: 0.82rem; }
     button { width: 100%; padding: 10px; background: #00ffcc; color: #000; font-weight: bold; border: none; border-radius: 6px; margin-top: 10px; cursor: pointer; }
     .btn-del { background: #ef4444; color: #fff; padding: 4px 8px; border-radius: 4px; border: none; cursor: pointer; font-size: 0.7rem; width: auto; margin-top: 0; }
     .user-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    .user-table td { padding: 6px 4px; border-bottom: 1px solid #1e293b; font-size: 0.8rem; }
-    .admin-panel { background: #070d17; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; margin-top: 12px; }
+    .user-table td { padding: 6px 4px; border-bottom: 1px solid #1e293b; font-size: 0.8rem; font-family: monospace; }
+    .panel { background: #070d17; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; margin-top: 14px; }
+    .hint { font-size: 0.72rem; color: #94a3b8; margin-top: 4px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>⚡ PROXY HUB (HTTP/S + SOCKS5)</h2>
+    <h2>⚡ MULTI-PROTOCOL PROXY HUB</h2>
     
     <div class="proxy-box">
       <div>
-        <div class="proxy-title">🚀 Multi-Protocol Server</div>
+        <div class="proxy-title">🚀 Endpoint Proxy (HTTP/S & SOCKS5)</div>
         <div class="proxy-val" id="proxy_full_text">${PROXY_SERVER_INFO.fullProxy || 'Loading...'}</div>
       </div>
       <button class="btn-copy" onclick="navigator.clipboard.writeText('${PROXY_SERVER_INFO.fullProxy}')">📋 SALIN</button>
@@ -626,56 +651,81 @@ function renderDashboardHTML() {
     <div class="badge-grid">
       <div class="badge"><h4>Koneksi Aktif</h4><div class="val" style="color:#39ff14;" id="active_count">0</div></div>
       <div class="badge"><h4>Mode Auth</h4><div class="val" style="color:#38bdf8; font-size:1.1rem;" id="badge_auth_mode">...</div></div>
-      <div class="badge"><h4>Total RX</h4><div class="val" style="color:#00ffcc;" id="total_rx">0 B</div></div>
-      <div class="badge"><h4>Total TX</h4><div class="val" style="color:#f59e0b;" id="total_tx">0 B</div></div>
+      <div class="badge"><h4>Total In (RX)</h4><div class="val" style="color:#00ffcc;" id="total_rx">0 B</div></div>
+      <div class="badge"><h4>Total Out (TX)</h4><div class="val" style="color:#f59e0b;" id="total_tx">0 B</div></div>
     </div>
 
-    <div class="section-title">🟢 LIVE CONNECTIONS</div>
+    <div class="section-title">🟢 LIVE CONNECTIONS (REALTIME)</div>
     <div class="conn-list" id="conn_container"></div>
 
-    <div id="admin_login_box" class="admin-panel" style="display:none; margin-top:16px;">
-      <div class="section-title" style="margin-top:0;">🔒 LOGIN ADMIN SETUP</div>
-      <input type="text" id="admin_user" placeholder="Username Admin">
-      <input type="password" id="admin_pass" placeholder="Password Admin">
+    <!-- 1. SETUP AWAL ADMIN (JIKA BELUM ADA ADMIN) -->
+    <div id="panel_initial_setup" class="panel" style="display:none; border-color:#f59e0b;">
+      <div class="section-title" style="margin-top:0; color:#f59e0b;">⚠️ SETUP ADMIN PERTAMA KALI</div>
+      <div class="hint">Buat akun Admin master untuk mengelola proxy server langsung dari browser:</div>
+      <input type="text" id="setup_admin_user" placeholder="Username Admin Baru">
+      <input type="password" id="setup_admin_pass" placeholder="Password Admin Baru">
+      <button style="background:#f59e0b;" onclick="setupAdmin()">SIMPAN & MASUK ADMIN</button>
+    </div>
+
+    <!-- 2. LOGIN ADMIN -->
+    <div id="panel_login" class="panel" style="display:none;">
+      <div class="section-title" style="margin-top:0;">🔒 LOGIN ADMIN CONTROL</div>
+      <input type="text" id="login_user" placeholder="Username Admin">
+      <input type="password" id="login_pass" placeholder="Password Admin">
       <button onclick="loginAdmin()">MASUK ADMIN</button>
     </div>
 
-    <div id="admin_controls" style="display:none;">
-      <div class="admin-panel">
+    <!-- 3. ADMIN CONTROLS (SETELAH LOGIN) -->
+    <div id="panel_admin_dashboard" style="display:none;">
+      
+      <!-- USER MANAGEMENT PROXY -->
+      <div class="panel">
         <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span class="section-title" style="margin:0;">👤 MANAJEMEN USER PROXY</span>
+          <span class="section-title" style="margin:0;">👤 USER & PASSWORD PROXY</span>
           <button onclick="logoutAdmin()" style="width:auto; padding:4px 8px; background:#475569; color:#fff; font-size:0.7rem; margin:0;">Logout</button>
         </div>
-        <div style="margin-top:8px;">
-          <label style="font-size:0.75rem; color:#94a3b8;">Auth Enforce:</label>
+        <div class="hint">Daftar kredensial yang berlaku untuk SOCKS5 & HTTP Proxy:</div>
+        
+        <div style="margin-top:10px;">
+          <label style="font-size:0.75rem; color:#94a3b8;">Enforce Mode:</label>
           <select id="select_auth_mode" onchange="changeAuthMode()">
-            <option value="AUTH">Wajib Auth (Private - SOCKS5 & HTTP)</option>
+            <option value="AUTH">Wajib User & Password (Private Proxy)</option>
             <option value="NONE">Tanpa Auth (Public Proxy)</option>
           </select>
         </div>
-        
+
         <table class="user-table">
           <tbody id="user_list_body"></tbody>
         </table>
 
-        <div style="display:flex; gap:6px; margin-top:8px;">
-          <input type="text" id="new_proxy_user" placeholder="User Baru">
-          <input type="text" id="new_proxy_pass" placeholder="Pass Baru">
+        <div style="display:flex; gap:6px; margin-top:10px;">
+          <input type="text" id="new_proxy_user" placeholder="User Proxy Baru">
+          <input type="text" id="new_proxy_pass" placeholder="Pass Proxy Baru">
         </div>
-        <button onclick="addUser()">+ TAMBAH USER</button>
+        <button onclick="addUser()">+ TAMBAH USER PROXY</button>
       </div>
 
-      <div class="admin-panel" style="margin-top:12px;">
+      <!-- EDIT AKUN ADMIN MASTER -->
+      <div class="panel">
+        <div class="section-title" style="margin:0;">🔑 GANTI AKUN ADMIN MASTER</div>
+        <input type="text" id="edit_admin_user" placeholder="Username Admin Baru">
+        <input type="password" id="edit_admin_pass" placeholder="Password Admin Baru">
+        <button style="background:#38bdf8;" onclick="changeAdminCreds()">UPDATE KREDENSIAL ADMIN</button>
+      </div>
+
+      <!-- DNS RESOLVER -->
+      <div class="panel">
         <div class="section-title" style="margin:0;">⚙️ DNS RESOLVER</div>
         <select id="preset_select">
-          <option value="cf-doh">Cloudflare DoH</option>
+          <option value="cf-doh">Cloudflare DoH (Official)</option>
           <option value="google-doh">Google DoH</option>
-          <option value="quad9-doh">Quad9 DoH</option>
-          <option value="adguard-doh">AdGuard DoH</option>
+          <option value="quad9-doh">Quad9 DoH (Security)</option>
+          <option value="adguard-doh">AdGuard DoH (Adblock)</option>
           <option value="cf-udp">Cloudflare UDP (1.1.1.1)</option>
         </select>
         <button onclick="saveDns()">💾 SIMPAN DNS</button>
       </div>
+
     </div>
   </div>
 
@@ -690,19 +740,29 @@ function renderDashboardHTML() {
         document.getElementById('total_tx').innerText = data.globalTotalOut;
         document.getElementById('badge_auth_mode').innerText = data.authMode;
 
-        if (data.isAuth) {
-          document.getElementById('admin_login_box').style.display = 'none';
-          document.getElementById('admin_controls').style.display = 'block';
-          document.getElementById('select_auth_mode').value = data.authMode;
-          renderUsers(data.userList);
+        // Routing Panel UI
+        if (!data.hasAdmin) {
+          document.getElementById('panel_initial_setup').style.display = 'block';
+          document.getElementById('panel_login').style.display = 'none';
+          document.getElementById('panel_admin_dashboard').style.display = 'none';
+        } else if (!data.isAuth) {
+          document.getElementById('panel_initial_setup').style.display = 'none';
+          document.getElementById('panel_login').style.display = 'block';
+          document.getElementById('panel_admin_dashboard').style.display = 'none';
         } else {
-          document.getElementById('admin_login_box').style.display = 'block';
-          document.getElementById('admin_controls').style.display = 'none';
+          document.getElementById('panel_initial_setup').style.display = 'none';
+          document.getElementById('panel_login').style.display = 'none';
+          document.getElementById('panel_admin_dashboard').style.display = 'block';
+          document.getElementById('select_auth_mode').value = data.authMode;
+          if (!document.getElementById('edit_admin_user').value) {
+            document.getElementById('edit_admin_user').value = data.adminUsername;
+          }
+          renderUsers(data.userList);
         }
 
         const container = document.getElementById('conn_container');
         if (!data.connections || data.connections.length === 0) {
-          container.innerHTML = '<div style="text-align:center;color:#64748b;font-size:0.75rem;padding:10px;">Belum ada koneksi...</div>';
+          container.innerHTML = '<div style="text-align:center;color:#64748b;font-size:0.75rem;padding:10px;">Belum ada perangkat terhubung...</div>';
           return;
         }
         container.innerHTML = data.connections.map(c => \`
@@ -721,27 +781,53 @@ function renderDashboardHTML() {
     function renderUsers(users) {
       const tbody = document.getElementById('user_list_body');
       if (!users || users.length === 0) {
-        tbody.innerHTML = '<tr><td style="color:#64748b;">Tidak ada user</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="3" style="color:#64748b; text-align:center;">Belum ada user proxy ditambahkan.</td></tr>';
         return;
       }
       tbody.innerHTML = users.map(u => \`
         <tr>
-          <td>👤 <b>\${u}</b></td>
-          <td style="text-align:right;"><button class="btn-del" onclick="deleteUser('\${u}')">Hapus</button></td>
+          <td>👤 <b>\${u.username}</b></td>
+          <td style="color:#94a3b8;">🔑 \${u.password}</td>
+          <td style="text-align:right;"><button class="btn-del" onclick="deleteUser('\${u.username}')">Hapus</button></td>
         </tr>
       \`).join('');
     }
 
+    async function setupAdmin() {
+      const u = document.getElementById('setup_admin_user').value;
+      const p = document.getElementById('setup_admin_pass').value;
+      if (!u || !p) return alert('Username & Password wajib diisi!');
+      const res = await fetch('/api/setup-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+      });
+      if (res.ok) fetchStats();
+      else alert('Setup gagal!');
+    }
+
     async function loginAdmin() {
-      const u = document.getElementById('admin_user').value;
-      const p = document.getElementById('admin_pass').value;
+      const u = document.getElementById('login_user').value;
+      const p = document.getElementById('login_pass').value;
       const res = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: u, password: p })
       });
       if (res.ok) fetchStats();
-      else alert('Login Gagal! Periksa username & password.');
+      else alert('Username atau Password Admin salah!');
+    }
+
+    async function changeAdminCreds() {
+      const u = document.getElementById('edit_admin_user').value;
+      const p = document.getElementById('edit_admin_pass').value;
+      if (!u || !p) return alert('Username & Password tidak boleh kosong!');
+      const res = await fetch('/api/change-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+      });
+      if (res.ok) alert('Akun Admin berhasil diperbarui!');
     }
 
     async function logoutAdmin() {
@@ -752,7 +838,7 @@ function renderDashboardHTML() {
     async function addUser() {
       const u = document.getElementById('new_proxy_user').value;
       const p = document.getElementById('new_proxy_pass').value;
-      if (!u || !p) return alert('Isi user dan pass');
+      if (!u || !p) return alert('Isi user dan password proxy!');
       await fetch('/api/manage-users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -800,5 +886,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Multi-Protocol SOCKS5 & HTTP Proxy running on port ${PORT}`);
+  console.log(`Proxy Hub Server running on port ${PORT}`);
 });
