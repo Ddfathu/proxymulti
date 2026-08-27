@@ -1,17 +1,74 @@
 import net from 'net';
 import dns from 'dns';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 const PORT = process.env.PORT || 8080;
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
+const DB_PATH = path.resolve(process.env.DATA_DIR || './', 'proxy_data.json');
 
-// --- CONFIG ADMIN & USER MANAGEMENT (KONTROL DARI UI) ---
+// --- STATE MANAGEMENT ---
 let ADMIN_CREDENTIALS = null; 
 const adminSessions = new Set();
 const proxyUsers = new Map(); 
-
 let PROXY_AUTH_MODE = 'AUTH'; 
+
+let DNS_CONFIG = {
+  mode: 'DOH',
+  activeName: 'Cloudflare DoH (Official)',
+  dohUrl: 'https://cloudflare-dns.com/dns-query',
+  udpServer: '1.1.1.1',
+  udpPort: 53
+};
+
+const PRESETS = {
+  'cf-doh': { name: 'Cloudflare DoH (Official)', type: 'DOH', url: 'https://cloudflare-dns.com/dns-query' },
+  'google-doh': { name: 'Google DoH', type: 'DOH', url: 'https://dns.google/dns-query' },
+  'quad9-doh': { name: 'Quad9 DoH (Security)', type: 'DOH', url: 'https://dns.quad9.net/dns-query' },
+  'adguard-doh': { name: 'AdGuard DoH (Adblock)', type: 'DOH', url: 'https://dns.adguard-dns.com/dns-query' },
+  'cf-udp': { name: 'Cloudflare UDP (1.1.1.1)', type: 'UDP', host: '1.1.1.1', port: 53 },
+  'google-udp': { name: 'Google UDP (8.8.8.8)', type: 'UDP', host: '8.8.8.8', port: 53 }
+};
+
+// --- FILE PERSISTENCE (AUTO-SAVE) ---
+function loadData() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const raw = fs.readFileSync(DB_PATH, 'utf-8');
+      const data = JSON.parse(raw);
+      if (data.admin) ADMIN_CREDENTIALS = data.admin;
+      if (data.authMode) PROXY_AUTH_MODE = data.authMode;
+      if (data.dnsConfig) DNS_CONFIG = data.dnsConfig;
+      if (Array.isArray(data.users)) {
+        proxyUsers.clear();
+        for (const [u, p] of data.users) {
+          proxyUsers.set(u, p);
+        }
+      }
+      console.log(`[Storage] Data loaded: ${proxyUsers.size} users, Admin: ${ADMIN_CREDENTIALS ? 'Configured' : 'None'}`);
+    }
+  } catch (err) {
+    console.error('[Storage Error] Failed to read database:', err.message);
+  }
+}
+
+function saveData() {
+  try {
+    const payload = {
+      admin: ADMIN_CREDENTIALS,
+      authMode: PROXY_AUTH_MODE,
+      dnsConfig: DNS_CONFIG,
+      users: Array.from(proxyUsers.entries())
+    };
+    fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[Storage Error] Failed to save database:', err.message);
+  }
+}
+
+loadData();
 
 let PROXY_SERVER_INFO = {
   domain: TCP_DOMAIN,
@@ -37,24 +94,6 @@ function updateRailwayProxyIP() {
 }
 updateRailwayProxyIP();
 setInterval(updateRailwayProxyIP, 1000 * 60 * 30);
-
-// State Konfigurasi DNS Aktif
-let DNS_CONFIG = {
-  mode: 'DOH',
-  activeName: 'Cloudflare DoH (Official)',
-  dohUrl: 'https://cloudflare-dns.com/dns-query',
-  udpServer: '1.1.1.1',
-  udpPort: 53
-};
-
-const PRESETS = {
-  'cf-doh': { name: 'Cloudflare DoH (Official)', type: 'DOH', url: 'https://cloudflare-dns.com/dns-query' },
-  'google-doh': { name: 'Google DoH', type: 'DOH', url: 'https://dns.google/dns-query' },
-  'quad9-doh': { name: 'Quad9 DoH (Security)', type: 'DOH', url: 'https://dns.quad9.net/dns-query' },
-  'adguard-doh': { name: 'AdGuard DoH (Adblock)', type: 'DOH', url: 'https://dns.adguard-dns.com/dns-query' },
-  'cf-udp': { name: 'Cloudflare UDP (1.1.1.1)', type: 'UDP', host: '1.1.1.1', port: 53 },
-  'google-udp': { name: 'Google UDP (8.8.8.8)', type: 'UDP', host: '8.8.8.8', port: 53 }
-};
 
 const activeConnections = new Map();
 let connectionIdCounter = 0;
@@ -151,6 +190,17 @@ function isAuthenticatedAdmin(dataStr) {
   return cookies.admin_session && adminSessions.has(cookies.admin_session);
 }
 
+function parseRequestBody(raw) {
+  const delimiterIndex = raw.indexOf('\r\n\r\n');
+  if (delimiterIndex === -1) return {};
+  const bodyStr = raw.slice(delimiterIndex + 4);
+  try {
+    return JSON.parse(bodyStr);
+  } catch (_) {
+    return {};
+  }
+}
+
 const server = net.createServer({ 
   noDelay: true,
   allowHalfOpen: false,
@@ -178,6 +228,7 @@ const server = net.createServer({
   let isFirstPacket = true;
   let targetSocket = null;
   let socksState = 0;
+  let httpBuffer = '';
 
   const bridgeSockets = (sockA, sockB) => {
     sockA.on('data', (d) => { 
@@ -293,80 +344,94 @@ const server = net.createServer({
     if (socksState > 0) return handleSocks5(chunk);
 
     if (isFirstPacket) {
-      isFirstPacket = false;
+      if (chunk[0] === 0x05) {
+        isFirstPacket = false;
+        return handleSocks5(chunk);
+      }
 
-      // 1. SOCKS5
-      if (chunk[0] === 0x05) return handleSocks5(chunk);
+      const chunkStr = chunk.toString('utf-8');
 
-      const dataStr = chunk.toString('utf-8');
+      // Check if it is an HTTP/API request
+      if (/^(GET|POST|PUT|DELETE|OPTIONS|HEAD)\s/i.test(chunkStr)) {
+        httpBuffer += chunkStr;
 
-      // 2. DASHBOARD & REST API
-      if (dataStr.startsWith('GET /') || dataStr.startsWith('POST /')) {
+        // Check if full HTTP message received
+        const contentLenMatch = httpBuffer.match(/Content-Length:\s*(\d+)/i);
+        const headerEnd = httpBuffer.indexOf('\r\n\r\n');
+        
+        if (contentLenMatch && headerEnd !== -1) {
+          const expectedLen = parseInt(contentLenMatch[1], 10);
+          const bodyLen = Buffer.byteLength(httpBuffer.slice(headerEnd + 4));
+          if (bodyLen < expectedLen) {
+            return; // Wait for remaining body packets
+          }
+        } else if (headerEnd === -1 && httpBuffer.startsWith('POST')) {
+          return; // Incomplete headers, wait
+        }
+
+        isFirstPacket = false;
+        const dataStr = httpBuffer;
         const firstLine = dataStr.split('\r\n')[0];
-        const path = firstLine.split(' ')[1] || '/';
+        const pathUrl = firstLine.split(' ')[1] || '/';
         const isAuth = isAuthenticatedAdmin(dataStr);
 
-        // API: Setup Admin Pertama Kali
-        if (path === '/api/setup-admin' && dataStr.startsWith('POST')) {
-          try {
-            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
-            if (!ADMIN_CREDENTIALS && body.username && body.password) {
-              ADMIN_CREDENTIALS = {
-                username: body.username.trim(),
-                password: body.password.trim()
-              };
-              const token = crypto.randomBytes(16).toString('hex');
-              adminSessions.add(token);
-              const resBody = JSON.stringify({ success: true });
-              clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=${token}; Path=/; HttpOnly\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-            } else {
-              const resBody = JSON.stringify({ success: false, error: 'Setup sudah selesai sebelumnya!' });
-              clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-            }
-          } catch (_) {}
+        // API: Setup Admin
+        if (pathUrl === '/api/setup-admin' && dataStr.startsWith('POST')) {
+          const body = parseRequestBody(dataStr);
+          if (!ADMIN_CREDENTIALS && body.username && body.password) {
+            ADMIN_CREDENTIALS = {
+              username: body.username.trim(),
+              password: body.password.trim()
+            };
+            saveData();
+            const token = crypto.randomBytes(16).toString('hex');
+            adminSessions.add(token);
+            const resBody = JSON.stringify({ success: true });
+            clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=${token}; Path=/; HttpOnly\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          } else {
+            const resBody = JSON.stringify({ success: false, error: 'Setup sudah selesai sebelumnya!' });
+            clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          }
           clientSocket.end();
           return;
         }
 
-        // API: Ganti Akun Admin Master
-        if (path === '/api/change-admin' && dataStr.startsWith('POST')) {
+        // API: Ganti Akun Admin
+        if (pathUrl === '/api/change-admin' && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
             return clientSocket.end();
           }
-          try {
-            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
-            if (body.username && body.password) {
-              ADMIN_CREDENTIALS.username = body.username.trim();
-              ADMIN_CREDENTIALS.password = body.password.trim();
-              const resBody = JSON.stringify({ success: true });
-              clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-            }
-          } catch (_) {}
+          const body = parseRequestBody(dataStr);
+          if (body.username && body.password) {
+            ADMIN_CREDENTIALS.username = body.username.trim();
+            ADMIN_CREDENTIALS.password = body.password.trim();
+            saveData();
+            const resBody = JSON.stringify({ success: true });
+            clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          }
           clientSocket.end();
           return;
         }
 
         // API: Login Admin
-        if (path === '/api/login' && dataStr.startsWith('POST')) {
-          try {
-            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
-            if (ADMIN_CREDENTIALS && body.username === ADMIN_CREDENTIALS.username && body.password === ADMIN_CREDENTIALS.password) {
-              const token = crypto.randomBytes(16).toString('hex');
-              adminSessions.add(token);
-              const resBody = JSON.stringify({ success: true });
-              clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=${token}; Path=/; HttpOnly\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-            } else {
-              const resBody = JSON.stringify({ success: false, error: 'Username atau Password salah!' });
-              clientSocket.write(`HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-            }
-          } catch (_) {}
+        if (pathUrl === '/api/login' && dataStr.startsWith('POST')) {
+          const body = parseRequestBody(dataStr);
+          if (ADMIN_CREDENTIALS && body.username === ADMIN_CREDENTIALS.username && body.password === ADMIN_CREDENTIALS.password) {
+            const token = crypto.randomBytes(16).toString('hex');
+            adminSessions.add(token);
+            const resBody = JSON.stringify({ success: true });
+            clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=${token}; Path=/; HttpOnly\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          } else {
+            const resBody = JSON.stringify({ success: false, error: 'Username atau Password salah!' });
+            clientSocket.write(`HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          }
           clientSocket.end();
           return;
         }
 
         // API: Logout
-        if (path === '/api/logout' && dataStr.startsWith('POST')) {
+        if (pathUrl === '/api/logout' && dataStr.startsWith('POST')) {
           const cookies = parseCookie(dataStr);
           if (cookies.admin_session) adminSessions.delete(cookies.admin_session);
           clientSocket.write(`HTTP/1.1 200 OK\r\nSet-Cookie: admin_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -375,7 +440,7 @@ const server = net.createServer({
         }
 
         // API: Stats Realtime
-        if (path === '/api/stats') {
+        if (pathUrl === '/api/stats') {
           const activeList = Array.from(activeConnections.values())
             .filter(c => !c.target.includes('railway.com') && !c.target.includes('up.railway.app'))
             .map(c => ({
@@ -415,15 +480,14 @@ const server = net.createServer({
           return;
         }
 
-        // API: Set DNS (Preset, Custom DoH, Custom UDP)
-        if (path.startsWith('/api/set-dns') && dataStr.startsWith('POST')) {
+        // API: Set DNS
+        if (pathUrl.startsWith('/api/set-dns') && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
             return clientSocket.end();
           }
           try {
-            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
-
+            const body = parseRequestBody(dataStr);
             if (body.preset && PRESETS[body.preset]) {
               const p = PRESETS[body.preset];
               DNS_CONFIG.mode = p.type;
@@ -441,6 +505,7 @@ const server = net.createServer({
               DNS_CONFIG.udpPort = parseInt(body.udpPort, 10) || 53;
             }
 
+            saveData();
             dnsCache.clear();
             const resBody = JSON.stringify({ success: true, config: DNS_CONFIG });
             clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
@@ -453,36 +518,37 @@ const server = net.createServer({
         }
 
         // API: Manage Proxy Users & Mode
-        if (path === '/api/manage-users' && dataStr.startsWith('POST')) {
+        if (pathUrl === '/api/manage-users' && dataStr.startsWith('POST')) {
           if (!isAuth) {
             clientSocket.write(`HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
             return clientSocket.end();
           }
-          try {
-            const body = JSON.parse(dataStr.split('\r\n\r\n')[1] || '{}');
-            if (body.action === 'add' && body.username && body.password) {
-              proxyUsers.set(body.username.trim(), body.password.trim());
-            } else if (body.action === 'delete' && body.username) {
-              proxyUsers.delete(body.username);
-            } else if (body.action === 'set-mode' && body.mode) {
-              PROXY_AUTH_MODE = body.mode;
-            }
-            const resBody = JSON.stringify({ success: true });
-            clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
-          } catch (_) {}
+          const body = parseRequestBody(dataStr);
+          if (body.action === 'add' && body.username && body.password) {
+            proxyUsers.set(body.username.trim(), body.password.trim());
+            saveData();
+          } else if (body.action === 'delete' && body.username) {
+            proxyUsers.delete(body.username);
+            saveData();
+          } else if (body.action === 'set-mode' && body.mode) {
+            PROXY_AUTH_MODE = body.mode;
+            saveData();
+          }
+          const resBody = JSON.stringify({ success: true });
+          clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
           clientSocket.end();
           return;
         }
 
         // Dashboard Web UI
-        if (path === '/' || path === '/index.html') {
+        if (pathUrl === '/' || pathUrl === '/index.html') {
           const html = renderDashboardHTML();
           clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(html)}\r\nConnection: close\r\n\r\n${html}`);
           clientSocket.end();
           return;
         }
 
-        // 3. HTTP SCANNER / PROXY
+        // HTTP Forward Proxy
         if (!checkHttpAuth(dataStr)) {
           const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
           clientSocket.write(authReq);
@@ -503,7 +569,7 @@ const server = net.createServer({
         targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
           targetSocket.setNoDelay(true);
           targetSocket.setKeepAlive(true, 5000);
-          targetSocket.write(chunk);
+          targetSocket.write(Buffer.from(httpBuffer));
           bridgeSockets(clientSocket, targetSocket);
         });
 
@@ -511,7 +577,10 @@ const server = net.createServer({
         return;
       }
 
-      // 4. HTTPS CONNECT PROXY
+      isFirstPacket = false;
+
+      // HTTPS CONNECT Proxy
+      const dataStr = chunk.toString('utf-8');
       if (dataStr.startsWith('CONNECT ')) {
         if (!checkHttpAuth(dataStr)) {
           const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
@@ -543,7 +612,7 @@ const server = net.createServer({
         }
       }
 
-      // 5. STREAM VLESS / TROJAN
+      // Stream VLESS / Trojan / Direct SNI
       const sni = parseTlsSni(chunk);
       const destinationHost = sni || 'speed.cloudflare.com';
 
@@ -653,7 +722,7 @@ function renderDashboardHTML() {
         <div class="proxy-title">🚀 Endpoint Proxy (HTTP/S & SOCKS5)</div>
         <div class="proxy-val" id="proxy_full_text">${PROXY_SERVER_INFO.fullProxy || 'Loading...'}</div>
       </div>
-      <button class="btn-copy" onclick="navigator.clipboard.writeText('${PROXY_SERVER_INFO.fullProxy}')">📋 SALIN</button>
+      <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('proxy_full_text').innerText)">📋 SALIN</button>
     </div>
 
     <div class="badge-grid">
@@ -777,6 +846,10 @@ function renderDashboardHTML() {
         document.getElementById('total_rx').innerText = data.globalTotalIn;
         document.getElementById('total_tx').innerText = data.globalTotalOut;
 
+        if (data.proxyInfo && data.proxyInfo.fullProxy) {
+          document.getElementById('proxy_full_text').innerText = data.proxyInfo.fullProxy;
+        }
+
         if (data.dnsConfig) {
           document.getElementById('badge_dns_mode').innerText = data.dnsConfig.mode + ' (' + (data.dnsConfig.activeName || 'Active') + ')';
           document.getElementById('badge_dns_target').innerText = data.dnsConfig.mode === 'DOH' 
@@ -879,17 +952,21 @@ function renderDashboardHTML() {
     }
 
     async function addUser() {
-      const u = document.getElementById('new_proxy_user').value;
-      const p = document.getElementById('new_proxy_pass').value;
+      const u = document.getElementById('new_proxy_user').value.trim();
+      const p = document.getElementById('new_proxy_pass').value.trim();
       if (!u || !p) return alert('Isi user dan password proxy!');
-      await fetch('/api/manage-users', {
+      const res = await fetch('/api/manage-users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'add', username: u, password: p })
       });
-      document.getElementById('new_proxy_user').value = '';
-      document.getElementById('new_proxy_pass').value = '';
-      fetchStats();
+      if (res.ok) {
+        document.getElementById('new_proxy_user').value = '';
+        document.getElementById('new_proxy_pass').value = '';
+        fetchStats();
+      } else {
+        alert('Gagal menambah user, sesi mungkin kedaluwarsa.');
+      }
     }
 
     async function deleteUser(u) {
@@ -955,5 +1032,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Multi-Protocol SOCKS5 & HTTP Proxy running on port ${PORT}`);
+  console.log(`[Server] Multi-Protocol Proxy & Dashboard running on port ${PORT}`);
 });
